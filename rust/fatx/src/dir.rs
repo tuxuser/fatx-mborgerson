@@ -1,4 +1,6 @@
+use std::io::Write;
 use std::path::{Component, Path};
+use std::time::SystemTime;
 
 use zerocopy::byteorder::{big_endian, little_endian};
 use zerocopy::*;
@@ -69,7 +71,7 @@ struct RawDirentXbox360 {
 }
 
 impl RawDirentXbox {
-    fn decode(&self, epoch: u16) -> DirectoryEntry {
+    fn decode(&self, epoch: u16, location: DirentLocation) -> DirectoryEntry {
         DirectoryEntry {
             filename_len: self.filename_len,
             attributes: self.attributes,
@@ -83,12 +85,29 @@ impl RawDirentXbox {
             accessed_time: self.accessed_time.into(),
             accessed_date: self.accessed_date.into(),
             epoch,
+            location: Some(location),
+        }
+    }
+
+    fn encode(entry: &DirectoryEntry) -> Self {
+        Self {
+            filename_len: entry.filename_len,
+            attributes: entry.attributes,
+            filename_bytes: entry.filename_bytes,
+            first_cluster: entry.first_cluster.into(),
+            file_size: entry.file_size.into(),
+            modified_time: entry.modified_time.into(),
+            modified_date: entry.modified_date.into(),
+            created_time: entry.created_time.into(),
+            created_date: entry.created_date.into(),
+            accessed_time: entry.accessed_time.into(),
+            accessed_date: entry.accessed_date.into(),
         }
     }
 }
 
 impl RawDirentXbox360 {
-    fn decode(&self, epoch: u16) -> DirectoryEntry {
+    fn decode(&self, epoch: u16, location: DirentLocation) -> DirectoryEntry {
         DirectoryEntry {
             filename_len: self.filename_len,
             attributes: self.attributes,
@@ -102,8 +121,34 @@ impl RawDirentXbox360 {
             accessed_time: self.accessed_time.into(),
             accessed_date: self.accessed_date.into(),
             epoch,
+            location: Some(location),
         }
     }
+
+    fn encode(entry: &DirectoryEntry) -> Self {
+        Self {
+            filename_len: entry.filename_len,
+            attributes: entry.attributes,
+            filename_bytes: entry.filename_bytes,
+            first_cluster: entry.first_cluster.into(),
+            file_size: entry.file_size.into(),
+            modified_time: entry.modified_time.into(),
+            modified_date: entry.modified_date.into(),
+            created_time: entry.created_time.into(),
+            created_date: entry.created_date.into(),
+            accessed_time: entry.accessed_time.into(),
+            accessed_date: entry.accessed_date.into(),
+        }
+    }
+}
+
+/// Where a `DirectoryEntry` lives on disk: which cluster of its parent
+/// directory, and which 64-byte slot within that cluster. Needed to write
+/// the entry back after mutating it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirentLocation {
+    pub(crate) cluster: ClusterId,
+    pub(crate) entry_index: u64,
 }
 
 /// A directory entry, decoded into native fields. This is platform-agnostic
@@ -124,6 +169,9 @@ pub struct DirectoryEntry {
     accessed_time: u16,
     accessed_date: u16,
     epoch: u16,
+    /// Where this entry lives on disk. `None` only for the synthetic root
+    /// entry, which isn't a real on-disk record and is never rewritten.
+    location: Option<DirentLocation>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -201,6 +249,7 @@ impl DirectoryEntry {
             accessed_time: 0,
             accessed_date: 0,
             epoch: fs.epoch,
+            location: None,
         })
     }
 
@@ -221,6 +270,10 @@ impl DirectoryEntry {
 
     pub fn file_size(&self) -> u32 {
         self.file_size
+    }
+
+    pub(crate) fn set_file_size(&mut self, size: u32) {
+        self.file_size = size;
     }
 
     pub fn is_directory(&self) -> bool {
@@ -262,6 +315,228 @@ impl DirectoryEntry {
     pub(crate) fn first_cluster(&self) -> ClusterId {
         self.first_cluster
     }
+
+    pub(crate) fn attributes(&self) -> u8 {
+        self.attributes
+    }
+
+    pub(crate) fn set_name(&mut self, name: &str) -> Result<(), Error> {
+        let (filename_bytes, filename_len) = encode_filename(name)?;
+        self.filename_bytes = filename_bytes;
+        self.filename_len = filename_len;
+        Ok(())
+    }
+
+    pub(crate) fn set_modified(&mut self, dt: DateTime) {
+        (self.modified_date, self.modified_time) = dt.to_fatx_encoding(self.epoch);
+    }
+
+    pub(crate) fn set_accessed(&mut self, dt: DateTime) {
+        (self.accessed_date, self.accessed_time) = dt.to_fatx_encoding(self.epoch);
+    }
+
+    /// Swaps every field except `location` (each entry keeps its own disk
+    /// slot) and `epoch` (filesystem-wide, not per-entry) -- used to
+    /// implement `rename`'s `exchange` semantics.
+    pub(crate) fn swap_content(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.filename_len, &mut other.filename_len);
+        std::mem::swap(&mut self.attributes, &mut other.attributes);
+        std::mem::swap(&mut self.filename_bytes, &mut other.filename_bytes);
+        std::mem::swap(&mut self.first_cluster, &mut other.first_cluster);
+        std::mem::swap(&mut self.file_size, &mut other.file_size);
+        std::mem::swap(&mut self.modified_time, &mut other.modified_time);
+        std::mem::swap(&mut self.modified_date, &mut other.modified_date);
+        std::mem::swap(&mut self.created_time, &mut other.created_time);
+        std::mem::swap(&mut self.created_date, &mut other.created_date);
+        std::mem::swap(&mut self.accessed_time, &mut other.accessed_time);
+        std::mem::swap(&mut self.accessed_date, &mut other.accessed_date);
+    }
+
+    /// Re-encodes this entry and writes it back to its on-disk slot.
+    pub(crate) fn write_back(&self, fs: &mut FatxFs) -> Result<(), Error> {
+        let location = self
+            .location
+            .expect("write_back called on an entry with no on-disk location");
+        fs.seek_cluster(
+            location.cluster,
+            location.entry_index * FATX_DIRENT_SIZE_BYTES,
+        )?;
+        match fs.variant {
+            Variant::Xbox => RawDirentXbox::encode(self).write_to_io(&mut fs.device_handle)?,
+            Variant::Xbox360 => {
+                RawDirentXbox360::encode(self).write_to_io(&mut fs.device_handle)?
+            }
+        };
+        Ok(())
+    }
+
+    /// Marks this entry's slot as deleted (a single `filename_len` byte
+    /// write) without touching its data cluster chain -- the caller
+    /// decides whether/when to free that separately (see `unlink`, and
+    /// `FatxFs::rename`'s cross-directory move, which keeps the chain
+    /// alive under a new dirent).
+    pub(crate) fn mark_deleted(&mut self, fs: &mut FatxFs) -> Result<(), Error> {
+        let location = self
+            .location
+            .expect("mark_deleted called on an entry with no on-disk location");
+        fs.seek_cluster(
+            location.cluster,
+            location.entry_index * FATX_DIRENT_SIZE_BYTES,
+        )?;
+        fs.device_handle.write_all(&[FATX_DELETED_FILE_MARKER])?;
+        self.filename_len = FATX_DELETED_FILE_MARKER;
+        Ok(())
+    }
+
+    /// Fully removes this entry: marks its slot deleted, then frees its
+    /// data cluster chain. Marking deleted *first* is a deliberate
+    /// ordering change from libfatx (which frees the chain before marking
+    /// deleted) -- that order leaves an unsafe window if interrupted,
+    /// where a live-looking dirent points at already-freed clusters.
+    pub(crate) fn unlink(mut self, fs: &mut FatxFs) -> Result<(), Error> {
+        self.mark_deleted(fs)?;
+        fs.free_cluster_chain(self.first_cluster)?;
+        Ok(())
+    }
+
+    /// Low-level: allocates a directory slot for `name` under
+    /// `parent_dir_first_cluster` and writes a dirent there with the given
+    /// content. Does not allocate or free `first_cluster` -- callers that
+    /// want a fresh file/directory should use `create_file`/
+    /// `create_directory`, which allocate a cluster and roll it back on
+    /// failure; `FatxFs::rename`'s cross-directory move calls this
+    /// directly with an existing cluster chain that must NOT be freed on
+    /// error (the source dirent still owns it).
+    pub(crate) fn create(
+        fs: &mut FatxFs,
+        parent_dir_first_cluster: ClusterId,
+        name: &str,
+        attributes: u8,
+        first_cluster: ClusterId,
+        file_size: u32,
+        timestamps: (DateTime, DateTime, DateTime),
+    ) -> Result<Self, Error> {
+        let (filename_bytes, filename_len) = encode_filename(name)?;
+
+        let mut iter = DirectoryEntryIterator::new(parent_dir_first_cluster);
+        let location = match iter.find_free_slot(fs)? {
+            FreeSlot::Reuse(location) => location,
+            FreeSlot::ExtendInCluster(location) => {
+                write_end_of_dir_marker(
+                    fs,
+                    DirentLocation {
+                        cluster: location.cluster,
+                        entry_index: location.entry_index + 1,
+                    },
+                )?;
+                location
+            }
+            FreeSlot::ExtendNewCluster {
+                old_marker_location,
+            } => {
+                // The current cluster is full: its last slot holds the
+                // stale end-of-directory marker. Allocate a new (zeroed)
+                // cluster -- its first slot becomes the new marker "for
+                // free" -- and reuse the old marker's slot for this entry.
+                let new_cluster = fs.alloc_cluster(true)?;
+                if let Err(err) = fs.attach_cluster(old_marker_location.cluster, new_cluster) {
+                    let _ = fs.free_cluster_chain(new_cluster);
+                    return Err(err);
+                }
+                old_marker_location
+            }
+        };
+
+        let epoch = fs.epoch;
+        let (created, modified, accessed) = timestamps;
+        let (created_date, created_time) = created.to_fatx_encoding(epoch);
+        let (modified_date, modified_time) = modified.to_fatx_encoding(epoch);
+        let (accessed_date, accessed_time) = accessed.to_fatx_encoding(epoch);
+
+        let entry = DirectoryEntry {
+            filename_len,
+            attributes,
+            filename_bytes,
+            first_cluster,
+            file_size,
+            modified_time,
+            modified_date,
+            created_time,
+            created_date,
+            accessed_time,
+            accessed_date,
+            epoch,
+            location: Some(location),
+        };
+        entry.write_back(fs)?;
+        Ok(entry)
+    }
+
+    /// Creates a new, empty file: allocates a fresh zeroed first cluster
+    /// and stamps all three timestamps to "now". Rolls back the allocated
+    /// cluster if slot allocation or the write fails.
+    pub(crate) fn create_file(
+        fs: &mut FatxFs,
+        parent_dir_first_cluster: ClusterId,
+        name: &str,
+    ) -> Result<Self, Error> {
+        Self::create_new(fs, parent_dir_first_cluster, name, 0)
+    }
+
+    /// Creates a new, empty directory. The fresh zeroed first cluster
+    /// (from `create_new`) is already a valid empty directory (`0x00` ==
+    /// end-of-directory at slot 0), so no extra initialization is needed.
+    pub(crate) fn create_directory(
+        fs: &mut FatxFs,
+        parent_dir_first_cluster: ClusterId,
+        name: &str,
+    ) -> Result<Self, Error> {
+        Self::create_new(fs, parent_dir_first_cluster, name, FATX_ATTR_DIRECTORY)
+    }
+
+    fn create_new(
+        fs: &mut FatxFs,
+        parent_dir_first_cluster: ClusterId,
+        name: &str,
+        attributes: u8,
+    ) -> Result<Self, Error> {
+        let first_cluster = fs.alloc_cluster(true)?;
+        let now = DateTime::from_system_time(SystemTime::now());
+        match Self::create(
+            fs,
+            parent_dir_first_cluster,
+            name,
+            attributes,
+            first_cluster,
+            0,
+            (now, now, now),
+        ) {
+            Ok(entry) => Ok(entry),
+            Err(err) => {
+                let _ = fs.free_cluster_chain(first_cluster);
+                Err(err)
+            }
+        }
+    }
+}
+
+fn write_end_of_dir_marker(fs: &mut FatxFs, location: DirentLocation) -> Result<(), Error> {
+    fs.seek_cluster(
+        location.cluster,
+        location.entry_index * FATX_DIRENT_SIZE_BYTES,
+    )?;
+    fs.device_handle.write_all(&[FATX_END_OF_DIR_MARKER])?;
+    Ok(())
+}
+
+fn encode_filename(name: &str) -> Result<([u8; FATX_MAX_FILENAME_LEN], u8), Error> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() >= FATX_MAX_FILENAME_LEN || bytes.contains(&b'/') {
+        return Err(Error::InvalidFilename);
+    }
+    let mut filename_bytes = [0u8; FATX_MAX_FILENAME_LEN];
+    filename_bytes[..bytes.len()].copy_from_slice(bytes);
+    Ok((filename_bytes, bytes.len() as u8))
 }
 
 pub(crate) struct DirectoryEntryIterator {
@@ -306,20 +581,23 @@ impl DirectoryEntryIterator {
         }
 
         // Fetch next entry
-        if let Err(seek_error) = fs.seek_cluster(
-            self.cluster,
-            self.entry as u64 * FATX_DIRENT_SIZE_BYTES,
-        ) {
+        if let Err(seek_error) =
+            fs.seek_cluster(self.cluster, self.entry as u64 * FATX_DIRENT_SIZE_BYTES)
+        {
             return Some(Err(seek_error));
         }
 
         let epoch = fs.epoch;
+        let location = DirentLocation {
+            cluster: self.cluster,
+            entry_index: self.entry as u64,
+        };
         let result = match fs.variant {
             Variant::Xbox => RawDirentXbox::read_from_io(&mut fs.device_handle)
-                .map(|raw| raw.decode(epoch))
+                .map(|raw| raw.decode(epoch, location))
                 .map_err(Error::from),
             Variant::Xbox360 => RawDirentXbox360::read_from_io(&mut fs.device_handle)
-                .map(|raw| raw.decode(epoch))
+                .map(|raw| raw.decode(epoch, location))
                 .map_err(Error::from),
         };
 
@@ -336,6 +614,54 @@ impl DirectoryEntryIterator {
             }
         }
     }
+
+    /// Scans this directory (starting at wherever this iterator currently
+    /// is) for a slot to reuse when creating a new entry: the first
+    /// deleted entry found, or (if none) the end-of-directory slot itself,
+    /// which the caller must either overwrite in place (if there's room
+    /// left in the cluster) or expand a new cluster to hold.
+    pub(crate) fn find_free_slot(&mut self, fs: &mut FatxFs) -> Result<FreeSlot, Error> {
+        loop {
+            match self.next(fs) {
+                None => return Err(Error::InvalidClusterChain),
+                Some(Err(err)) => return Err(err),
+                Some(Ok(dirent)) => {
+                    let location = dirent
+                        .location
+                        .expect("entries yielded by the iterator always have a location");
+                    match dirent.kind() {
+                        DirectoryEntryKind::Deleted => return Ok(FreeSlot::Reuse(location)),
+                        DirectoryEntryKind::EndOfDirectory => {
+                            return Ok(if location.entry_index + 1 < fs.num_entries_per_cluster {
+                                FreeSlot::ExtendInCluster(location)
+                            } else {
+                                FreeSlot::ExtendNewCluster {
+                                    old_marker_location: location,
+                                }
+                            });
+                        }
+                        DirectoryEntryKind::Valid => continue,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where to write a new directory entry, as determined by
+/// `DirectoryEntryIterator::find_free_slot`.
+pub(crate) enum FreeSlot {
+    /// Reuse a previously-deleted slot.
+    Reuse(DirentLocation),
+    /// The end-of-directory marker can just shift forward one slot within
+    /// the current cluster, vacating this slot.
+    ExtendInCluster(DirentLocation),
+    /// The current cluster is full: `old_marker_location` is its last slot,
+    /// currently holding the stale end-of-directory marker. The caller
+    /// must allocate and attach a new (zeroed) cluster -- whose first slot
+    /// becomes the new marker for free -- and then reuse
+    /// `old_marker_location` for the new entry.
+    ExtendNewCluster { old_marker_location: DirentLocation },
 }
 
 pub struct DirectoryEntryIntoIterator {
@@ -409,10 +735,17 @@ mod tests {
         (((year - epoch) & 0x7f) << 9) | ((month & 0xf) << 5) | (day & 0x1f)
     }
 
+    fn dummy_location() -> DirentLocation {
+        DirentLocation {
+            cluster: 1,
+            entry_index: 0,
+        }
+    }
+
     #[test]
     fn decode_xbox_dirent() {
         let raw = RawDirentXbox::read_from_bytes(&xbox_raw_bytes()).unwrap();
-        let entry = raw.decode(2000);
+        let entry = raw.decode(2000, dummy_location());
         assert_eq!(entry.file_name(), "test");
         assert!(entry.is_directory());
         assert_eq!(entry.first_cluster(), 5);
@@ -424,12 +757,52 @@ mod tests {
     #[test]
     fn decode_xbox360_dirent() {
         let raw = RawDirentXbox360::read_from_bytes(&xbox360_raw_bytes()).unwrap();
-        let entry = raw.decode(1980);
+        let entry = raw.decode(1980, dummy_location());
         assert_eq!(entry.file_name(), "test");
         assert!(entry.is_directory());
         assert_eq!(entry.first_cluster(), 5);
         assert_eq!(entry.created().year(), 2005);
         assert_eq!(entry.created().month(), 6);
         assert_eq!(entry.created().day(), 15);
+    }
+
+    #[test]
+    fn xbox_dirent_encode_round_trips_against_fixture() {
+        let bytes = xbox_raw_bytes();
+        let raw = RawDirentXbox::read_from_bytes(&bytes).unwrap();
+        let entry = raw.decode(2000, dummy_location());
+        let re_encoded = RawDirentXbox::encode(&entry);
+        assert_eq!(re_encoded.as_bytes(), &bytes[..]);
+    }
+
+    #[test]
+    fn xbox360_dirent_encode_round_trips_against_fixture() {
+        let bytes = xbox360_raw_bytes();
+        let raw = RawDirentXbox360::read_from_bytes(&bytes).unwrap();
+        let entry = raw.decode(1980, dummy_location());
+        let re_encoded = RawDirentXbox360::encode(&entry);
+        assert_eq!(re_encoded.as_bytes(), &bytes[..]);
+    }
+
+    #[test]
+    fn encode_filename_accepts_valid_names() {
+        let (bytes, len) = encode_filename("test.txt").unwrap();
+        assert_eq!(len, 8);
+        assert_eq!(&bytes[..8], b"test.txt");
+        assert!(bytes[8..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encode_filename_rejects_invalid_names() {
+        assert!(matches!(encode_filename(""), Err(Error::InvalidFilename)));
+        assert!(matches!(
+            encode_filename(&"a".repeat(42)),
+            Err(Error::InvalidFilename)
+        ));
+        assert!(encode_filename(&"a".repeat(41)).is_ok());
+        assert!(matches!(
+            encode_filename("a/b"),
+            Err(Error::InvalidFilename)
+        ));
     }
 }

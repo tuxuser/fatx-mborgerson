@@ -15,3 +15,6 @@ zerocopy-derive = "0.8.25"
 log = "0.4"
 env_logger = "0.10"
 thiserror = "2.0.12"
+
+[dev-dependencies]
+tempfile = "3"

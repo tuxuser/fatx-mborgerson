@@ -25,6 +25,18 @@ pub enum Error {
     NotADirectory,
     #[error("the path unxpectedly identifies a directory")]
     IsADirectory,
+    #[error("the filesystem has no free clusters remaining")]
+    FilesystemFull,
+    #[error("the directory is not empty")]
+    DirectoryNotEmpty,
+    #[error("a file or directory already exists at the destination path")]
+    AlreadyExists,
+    #[error("the filename is invalid")]
+    InvalidFilename,
+    #[error("exchange and no_replace cannot both be set")]
+    InvalidRenameFlags,
+    #[error("the source and destination of a rename must both be files, or both be directories")]
+    RenameTypeMismatch,
 }
 
 impl From<Error> for io::Error {
@@ -34,6 +46,12 @@ impl From<Error> for io::Error {
             Error::NotFound => io::Error::new(io::ErrorKind::NotFound, err),
             Error::NotADirectory => io::Error::new(io::ErrorKind::NotADirectory, err),
             Error::IsADirectory => io::Error::new(io::ErrorKind::IsADirectory, err),
+            Error::FilesystemFull => io::Error::new(io::ErrorKind::StorageFull, err),
+            Error::DirectoryNotEmpty => io::Error::new(io::ErrorKind::DirectoryNotEmpty, err),
+            Error::AlreadyExists => io::Error::new(io::ErrorKind::AlreadyExists, err),
+            Error::InvalidFilename => io::Error::new(io::ErrorKind::InvalidInput, err),
+            Error::InvalidRenameFlags => io::Error::new(io::ErrorKind::InvalidInput, err),
+            Error::RenameTypeMismatch => io::Error::new(io::ErrorKind::InvalidInput, err),
             _ => io::Error::other(err),
         }
     }
