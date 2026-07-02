@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use bimap::BiMap;
 use clap::Parser;
 use clap::builder::styling::{AnsiColor, Effects, Style, Styles};
-use fatx::{DirectoryEntry, FatxFs, FatxFsConfig, FatxFsHandle};
+use fatx::{DirectoryEntry, FatxFs, FatxFsConfig, FatxFsHandle, Xbox360DevkitPartition};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
@@ -274,9 +274,20 @@ struct Cli {
     #[arg()]
     mount_point: String,
 
-    /// Drive letter of c|e|x|y|z
+    /// Partition to mount. For the original Xbox: c|e|x|y|z. For an Xbox
+    /// 360 (--xbox360): data|compat (retail), or content|dashboard
+    /// (--xbox360 --devkit).
     #[arg(short, long, default_value_t = String::from("c"))]
     drive_letter: String,
+
+    /// Target an Xbox 360 (XTAF) volume instead of the original Xbox
+    #[arg(long)]
+    xbox360: bool,
+
+    /// With --xbox360, read the on-disk devkit partition table instead of
+    /// using fixed retail offsets
+    #[arg(long)]
+    devkit: bool,
 
     /// Auto-unmount
     #[arg(long)]
@@ -285,6 +296,23 @@ struct Cli {
     /// Allow root
     #[arg(long)]
     allow_root: bool,
+}
+
+fn xbox360_config(device_path: String, drive_letter: &str, devkit: bool) -> FatxFsConfig {
+    if devkit {
+        let partition = match drive_letter {
+            "content" => Xbox360DevkitPartition::Content,
+            "dashboard" => Xbox360DevkitPartition::Dashboard,
+            other => panic!("invalid devkit partition '{other}', expected content|dashboard"),
+        };
+        FatxFsConfig::xbox360_devkit(device_path, partition)
+    } else {
+        match drive_letter {
+            "data" => FatxFsConfig::xbox360_retail_data(device_path),
+            "compat" => FatxFsConfig::xbox360_retail_compat(device_path),
+            other => panic!("invalid retail partition '{other}', expected data|compat"),
+        }
+    }
 }
 
 fn main() {
@@ -298,7 +326,11 @@ fn main() {
         options.push(MountOption::AllowRoot);
     }
 
-    let config = FatxFsConfig::new(cli.device_path).drive_letter(&cli.drive_letter);
+    let config = if cli.xbox360 {
+        xbox360_config(cli.device_path, &cli.drive_letter, cli.devkit)
+    } else {
+        FatxFsConfig::new(cli.device_path).drive_letter(&cli.drive_letter)
+    };
 
     let fs = FuseFatxFs {
         fatx: FatxFs::open_device(&config).unwrap(),

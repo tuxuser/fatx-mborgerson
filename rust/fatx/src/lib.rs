@@ -12,4 +12,4 @@ pub use dir::DirectoryEntry;
 pub use error::Error;
 pub use file::File;
 pub use fs::{FatxFs, FatxFsConfig, FatxFsHandle};
-pub use partition::{DEFAULT_PARTITION_LAYOUT, PartitionMapEntry};
+pub use partition::{DEFAULT_PARTITION_LAYOUT, PartitionMapEntry, Xbox360DevkitPartition};

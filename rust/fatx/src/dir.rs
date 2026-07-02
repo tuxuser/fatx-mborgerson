@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
 
-use zerocopy::byteorder::little_endian::{U16, U32};
+use zerocopy::byteorder::{big_endian, little_endian};
 use zerocopy::*;
 
 const FATX_MAX_FILENAME_LEN: usize = 42;
@@ -17,27 +17,113 @@ const FATX_ATTR_HIDDEN: u8 = 1 << 2;
 const FATX_ATTR_VOLUME: u8 = 1 << 3;
 const FATX_ATTR_DIRECTORY: u8 = 1 << 4;
 
+// Directory entries are 64 bytes on disk on both platforms. DirectoryEntry
+// itself can't be used for this since it holds decoded native fields (plus
+// an epoch marker), not a 1:1 image of the wire format.
+pub(crate) const FATX_DIRENT_SIZE_BYTES: u64 = 64;
+
 use crate::datetime::DateTime;
 use crate::error::Error;
 use crate::fat::{ClusterId, FatEntry};
-use crate::fs::{FatxFs, FatxFsHandle};
+use crate::fs::{FatxFs, FatxFsHandle, Variant};
 use crate::path::normalize_virtual_path;
 
-// The directory entry, as it appears on disk.
+// The directory entry, as it appears on disk on the original Xbox:
+// little-endian, Modified/Created/Accessed order, time-then-date pairs.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Debug)]
 #[repr(C, packed)]
+struct RawDirentXbox {
+    filename_len: u8,
+    attributes: u8,
+    filename_bytes: [u8; FATX_MAX_FILENAME_LEN],
+    first_cluster: little_endian::U32,
+    file_size: little_endian::U32,
+    modified_time: little_endian::U16,
+    modified_date: little_endian::U16,
+    created_time: little_endian::U16,
+    created_date: little_endian::U16,
+    accessed_time: little_endian::U16,
+    accessed_date: little_endian::U16,
+}
+
+// The directory entry, as it appears on disk on the Xbox 360: big-endian,
+// Created/Modified/Accessed order, date-then-time pairs. filename/
+// attributes/first_cluster/file_size are laid out identically to the
+// original Xbox; only the timestamp block differs. Confirmed against
+// free60.org/System-Software/Systems/FATX and a real retail-partitioned
+// drive.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Debug)]
+#[repr(C, packed)]
+struct RawDirentXbox360 {
+    filename_len: u8,
+    attributes: u8,
+    filename_bytes: [u8; FATX_MAX_FILENAME_LEN],
+    first_cluster: big_endian::U32,
+    file_size: big_endian::U32,
+    created_date: big_endian::U16,
+    created_time: big_endian::U16,
+    modified_date: big_endian::U16,
+    modified_time: big_endian::U16,
+    accessed_date: big_endian::U16,
+    accessed_time: big_endian::U16,
+}
+
+impl RawDirentXbox {
+    fn decode(&self, epoch: u16) -> DirectoryEntry {
+        DirectoryEntry {
+            filename_len: self.filename_len,
+            attributes: self.attributes,
+            filename_bytes: self.filename_bytes,
+            first_cluster: self.first_cluster.into(),
+            file_size: self.file_size.into(),
+            modified_time: self.modified_time.into(),
+            modified_date: self.modified_date.into(),
+            created_time: self.created_time.into(),
+            created_date: self.created_date.into(),
+            accessed_time: self.accessed_time.into(),
+            accessed_date: self.accessed_date.into(),
+            epoch,
+        }
+    }
+}
+
+impl RawDirentXbox360 {
+    fn decode(&self, epoch: u16) -> DirectoryEntry {
+        DirectoryEntry {
+            filename_len: self.filename_len,
+            attributes: self.attributes,
+            filename_bytes: self.filename_bytes,
+            first_cluster: self.first_cluster.into(),
+            file_size: self.file_size.into(),
+            modified_time: self.modified_time.into(),
+            modified_date: self.modified_date.into(),
+            created_time: self.created_time.into(),
+            created_date: self.created_date.into(),
+            accessed_time: self.accessed_time.into(),
+            accessed_date: self.accessed_date.into(),
+            epoch,
+        }
+    }
+}
+
+/// A directory entry, decoded into native fields. This is platform-agnostic
+/// -- the on-disk byte order, timestamp field order, and timestamp epoch
+/// differences between the original Xbox and Xbox 360 are resolved when the
+/// entry is read (see `RawDirentXbox`/`RawDirentXbox360`).
+#[derive(Debug)]
 pub struct DirectoryEntry {
     filename_len: u8,
     attributes: u8,
     filename_bytes: [u8; FATX_MAX_FILENAME_LEN],
-    first_cluster: U32,
-    file_size: U32,
-    modified_time: U16,
-    modified_date: U16,
-    created_time: U16,
-    created_date: U16,
-    accessed_time: U16,
-    accessed_date: U16,
+    first_cluster: u32,
+    file_size: u32,
+    modified_time: u16,
+    modified_date: u16,
+    created_time: u16,
+    created_date: u16,
+    accessed_time: u16,
+    accessed_date: u16,
+    epoch: u16,
 }
 
 #[derive(Debug, PartialEq)]
@@ -85,7 +171,7 @@ impl DirectoryEntry {
                                 return Ok(dirent);
                             }
                             if dirent.is_directory() {
-                                break Some(dirent.first_cluster.into());
+                                break Some(dirent.first_cluster());
                             }
                             return Err(Error::NotADirectory);
                         }
@@ -106,14 +192,15 @@ impl DirectoryEntry {
                 filename_bytes[0..4].copy_from_slice(b"root");
                 filename_bytes
             },
-            first_cluster: fs.root_cluster.into(),
-            file_size: 0.into(),
-            modified_date: 0.into(),
-            modified_time: 0.into(),
-            created_time: 0.into(),
-            created_date: 0.into(),
-            accessed_time: 0.into(),
-            accessed_date: 0.into(),
+            first_cluster: fs.root_cluster,
+            file_size: 0,
+            modified_date: 0,
+            modified_time: 0,
+            created_time: 0,
+            created_date: 0,
+            accessed_time: 0,
+            accessed_date: 0,
+            epoch: fs.epoch,
         })
     }
 
@@ -133,7 +220,7 @@ impl DirectoryEntry {
     }
 
     pub fn file_size(&self) -> u32 {
-        self.file_size.into()
+        self.file_size
     }
 
     pub fn is_directory(&self) -> bool {
@@ -161,19 +248,19 @@ impl DirectoryEntry {
     }
 
     pub fn created(&self) -> DateTime {
-        DateTime::from_fatx_encoding(self.created_date.into(), self.created_time.into())
+        DateTime::from_fatx_encoding(self.created_date, self.created_time, self.epoch)
     }
 
     pub fn modified(&self) -> DateTime {
-        DateTime::from_fatx_encoding(self.modified_date.into(), self.modified_time.into())
+        DateTime::from_fatx_encoding(self.modified_date, self.modified_time, self.epoch)
     }
 
     pub fn accessed(&self) -> DateTime {
-        DateTime::from_fatx_encoding(self.accessed_date.into(), self.accessed_time.into())
+        DateTime::from_fatx_encoding(self.accessed_date, self.accessed_time, self.epoch)
     }
 
     pub(crate) fn first_cluster(&self) -> ClusterId {
-        self.first_cluster.into()
+        self.first_cluster
     }
 }
 
@@ -221,15 +308,25 @@ impl DirectoryEntryIterator {
         // Fetch next entry
         if let Err(seek_error) = fs.seek_cluster(
             self.cluster,
-            self.entry as u64 * std::mem::size_of::<DirectoryEntry>() as u64,
+            self.entry as u64 * FATX_DIRENT_SIZE_BYTES,
         ) {
             return Some(Err(seek_error));
         }
 
-        match DirectoryEntry::read_from_io(&mut fs.device_handle) {
+        let epoch = fs.epoch;
+        let result = match fs.variant {
+            Variant::Xbox => RawDirentXbox::read_from_io(&mut fs.device_handle)
+                .map(|raw| raw.decode(epoch))
+                .map_err(Error::from),
+            Variant::Xbox360 => RawDirentXbox360::read_from_io(&mut fs.device_handle)
+                .map(|raw| raw.decode(epoch))
+                .map_err(Error::from),
+        };
+
+        match result {
             Err(err) => {
                 self.finished = true;
-                Some(Err(err.into()))
+                Some(Err(err))
             }
             Ok(entry) => {
                 if entry.kind() == DirectoryEntryKind::EndOfDirectory {
@@ -273,5 +370,66 @@ impl Iterator for DirectoryEntryIntoIterator {
                 return item;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xbox_raw_bytes() -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        buf[0] = 4; // filename_len
+        buf[1] = FATX_ATTR_DIRECTORY; // attributes
+        buf[2..6].copy_from_slice(b"test");
+        buf[0x2c..0x30].copy_from_slice(&5u32.to_le_bytes()); // first_cluster
+        buf[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // file_size
+        // modified_time, modified_date, created_time, created_date,
+        // accessed_time, accessed_date (time-then-date, LE)
+        buf[0x38..0x3a].copy_from_slice(&0x0000u16.to_le_bytes()); // created_time
+        buf[0x3a..0x3c].copy_from_slice(&encode_date(2005, 6, 15, 2000).to_le_bytes()); // created_date
+        buf
+    }
+
+    fn xbox360_raw_bytes() -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        buf[0] = 4; // filename_len
+        buf[1] = FATX_ATTR_DIRECTORY; // attributes
+        buf[2..6].copy_from_slice(b"test");
+        buf[0x2c..0x30].copy_from_slice(&5u32.to_be_bytes()); // first_cluster
+        buf[0x30..0x34].copy_from_slice(&0u32.to_be_bytes()); // file_size
+        // created_date, created_time, modified_date, modified_time,
+        // accessed_date, accessed_time (date-then-time, BE)
+        buf[0x34..0x36].copy_from_slice(&encode_date(2005, 6, 15, 1980).to_be_bytes()); // created_date
+        buf[0x36..0x38].copy_from_slice(&0x0000u16.to_be_bytes()); // created_time
+        buf
+    }
+
+    fn encode_date(year: u16, month: u16, day: u16, epoch: u16) -> u16 {
+        (((year - epoch) & 0x7f) << 9) | ((month & 0xf) << 5) | (day & 0x1f)
+    }
+
+    #[test]
+    fn decode_xbox_dirent() {
+        let raw = RawDirentXbox::read_from_bytes(&xbox_raw_bytes()).unwrap();
+        let entry = raw.decode(2000);
+        assert_eq!(entry.file_name(), "test");
+        assert!(entry.is_directory());
+        assert_eq!(entry.first_cluster(), 5);
+        assert_eq!(entry.created().year(), 2005);
+        assert_eq!(entry.created().month(), 6);
+        assert_eq!(entry.created().day(), 15);
+    }
+
+    #[test]
+    fn decode_xbox360_dirent() {
+        let raw = RawDirentXbox360::read_from_bytes(&xbox360_raw_bytes()).unwrap();
+        let entry = raw.decode(1980);
+        assert_eq!(entry.file_name(), "test");
+        assert!(entry.is_directory());
+        assert_eq!(entry.first_cluster(), 5);
+        assert_eq!(entry.created().year(), 2005);
+        assert_eq!(entry.created().month(), 6);
+        assert_eq!(entry.created().day(), 15);
     }
 }

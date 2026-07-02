@@ -1,9 +1,10 @@
-use zerocopy::byteorder::little_endian::{U16, U32};
+use zerocopy::byteorder::big_endian;
+use zerocopy::byteorder::little_endian;
 use zerocopy::*;
 
 use crate::error::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum FatType {
     Type16,
     Type32,
@@ -54,12 +55,13 @@ impl From<u32> for FatEntry {
 #[derive(Debug)]
 pub(crate) struct Fat {
     fat_type: FatType,
+    big_endian: bool,
     pub(crate) fat_size_bytes: u64,
     pub(crate) fat_data: Vec<u8>, // FIXME: Smarter cache
 }
 
 impl Fat {
-    pub(crate) fn new(num_fat_entries: u32) -> Self {
+    pub(crate) fn new(num_fat_entries: u32, big_endian: bool) -> Self {
         // NOTE: this *MUST* be kept below the Cluster Reserved marker for FAT16
         let (fat_type, fat_size_bytes) = if num_fat_entries < 0xfff0 {
             (
@@ -77,15 +79,16 @@ impl Fat {
 
         Self {
             fat_type,
+            big_endian,
             fat_size_bytes,
             fat_data,
         }
     }
 
     pub(crate) fn entry(&mut self, index: FatEntryId) -> Result<FatEntry, Error> {
-        match self.fat_type {
-            FatType::Type16 => {
-                let fat = <[U16]>::ref_from_bytes_with_elems(
+        match (self.fat_type, self.big_endian) {
+            (FatType::Type16, false) => {
+                let fat = <[little_endian::U16]>::ref_from_bytes_with_elems(
                     &self.fat_data[..],
                     (self.fat_size_bytes / 2) as usize,
                 )
@@ -93,8 +96,26 @@ impl Fat {
                 let value: u16 = fat[index as usize].into();
                 Ok(value.into())
             }
-            FatType::Type32 => {
-                let fat = <[U32]>::ref_from_bytes_with_elems(
+            (FatType::Type16, true) => {
+                let fat = <[big_endian::U16]>::ref_from_bytes_with_elems(
+                    &self.fat_data[..],
+                    (self.fat_size_bytes / 2) as usize,
+                )
+                .unwrap();
+                let value: u16 = fat[index as usize].into();
+                Ok(value.into())
+            }
+            (FatType::Type32, false) => {
+                let fat = <[little_endian::U32]>::ref_from_bytes_with_elems(
+                    &self.fat_data[..],
+                    (self.fat_size_bytes / 4) as usize,
+                )
+                .unwrap();
+                let value: u32 = fat[index as usize].into();
+                Ok(value.into())
+            }
+            (FatType::Type32, true) => {
+                let fat = <[big_endian::U32]>::ref_from_bytes_with_elems(
                     &self.fat_data[..],
                     (self.fat_size_bytes / 4) as usize,
                 )

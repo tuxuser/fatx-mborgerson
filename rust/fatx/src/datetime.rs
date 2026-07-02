@@ -1,4 +1,6 @@
-const FATX_EPOCH: u16 = 2000;
+pub const FATX_EPOCH_XBOX: u16 = 2000;
+pub const FATX_EPOCH_XBOX360: u16 = 1980;
+
 pub struct Date {
     year: u16,
     /// 1 = January
@@ -7,9 +9,9 @@ pub struct Date {
 }
 
 impl Date {
-    pub fn from_fatx_encoding(encoded: u16) -> Self {
+    pub fn from_fatx_encoding(encoded: u16, epoch: u16) -> Self {
         Self {
-            year: (((encoded >> 9) & 0x7f) + FATX_EPOCH),
+            year: (((encoded >> 9) & 0x7f) + epoch),
             month: ((encoded >> 5) & 0xf) as u8,
             day: (encoded & 0x1f) as u8,
         }
@@ -59,9 +61,9 @@ pub struct DateTime {
 }
 
 impl DateTime {
-    pub fn from_fatx_encoding(date_encoded: u16, time_encoded: u16) -> Self {
+    pub fn from_fatx_encoding(date_encoded: u16, time_encoded: u16, epoch: u16) -> Self {
         Self {
-            date: Date::from_fatx_encoding(date_encoded),
+            date: Date::from_fatx_encoding(date_encoded, epoch),
             time: Time::from_fatx_encoding(time_encoded),
         }
     }
