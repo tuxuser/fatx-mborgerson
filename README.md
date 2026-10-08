@@ -12,6 +12,8 @@ There is work-in-progress towards a Rust implementation:
 * [**fatx**](rust/fatx/README.md) is a Rust crate for working with the FATX filesystem, like libfatx.
 * [**fatx-fuse**](rust/fatx-fuse/README.md) is a Rust crate providing a FUSE driver based on fuser and fatx.
 
+For X360 Linux you want to use the WIP Rust implementation, see [fatx-fuse](./rust/fatx-fuse/README.md).
+
 License
 -------
 See LICENSE.txt

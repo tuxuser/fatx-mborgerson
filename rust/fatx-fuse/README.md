@@ -21,6 +21,21 @@ types.
 How-to
 ------------------------------
 
+### Cross compiling for X360 Linux (PPC32 userspace)
+
+Make sure to point SYSROOT / SR to your actual root filesystem.
+In this example I am using an extracted archPOWER squashfs utilized as nfsroot.
+
+```sh
+SR=/srv/nfs/archpower                                  # PPC32 sysroot
+GCCLIB=$SR/usr/lib/gcc/powerpc-unknown-linux-gnu/16    # libgcc_s.so
+
+cd rust
+CARGO_TARGET_POWERPC_UNKNOWN_LINUX_GNU_LINKER=powerpc64-linux-gnu-gcc \
+CARGO_TARGET_POWERPC_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-m32 -C link-arg=--sysroot=$SR -C link-arg=-mcpu=powerpc -C link-arg=-L$GCCLIB" \
+cargo build --release --target powerpc-unknown-linux-gnu -p fatx-fuse
+```
+
 ### Original Xbox HDD
 
 Select a partition with `--drive-letter` (`c`, `e`, `x`, `y`, or `z`,
