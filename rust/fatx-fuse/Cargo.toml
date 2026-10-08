@@ -14,7 +14,7 @@ fatx = { path = "../fatx", version = "0.2.0-dev" }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
-fuser = "0.15.1"
+fuser = { version = "0.15.1", default-features = false }
 libc = "0.2.172"
 bimap = "0.6.3"
 chrono = "0.4.41"
